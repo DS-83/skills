@@ -5,34 +5,22 @@ import (
 )
 
 func RunConveyor(tasksFlow ...task) {
-
-	channels := []chan interface{}{}
-
-	for i := 0; i < len(tasksFlow); i++ {
-		ch := make(chan interface{})
-		channels = append(channels, ch)
-	}
+	in := make(chan interface{})
 
 	var wg sync.WaitGroup
-	wg.Add(len(tasksFlow))
 
-	for i, task := range tasksFlow {
-		in := channels[i]
-		out := channels[i]
+	for _, task := range tasksFlow {
+		out := make(chan interface{})
 
-		if i == len(channels)-1 {
-			out = channels[0]
-		} else {
-			out = channels[i+1]
-		}
-
-		go func(task func(in, out chan interface{})) {
+		wg.Add(1)
+		go func(task func(in, out chan interface{}), in, out chan interface{}) {
 			task(in, out)
 			close(out)
 			wg.Done()
 
-		}(task)
+		}(task, in, out)
 
+		in = out
 	}
 
 	wg.Wait()
