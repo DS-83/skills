@@ -8,32 +8,43 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	regexpStr = `((([A-Za-z]{3,9}:(?:\/\/)?)(?:[-;:&=\+\$,\w]+@)?[A-Za-z0-9.-]+|(?:www.|[-;:&=\+\$,\w]+@)[A-Za-z0-9.-]+)((?:\/[\+~%\/.\w-_]*)?\??(?:[-\+=&;%@.\w_]*)#?(?:[.\!\/\\w]*))?)`
+	regexpStr = `(((http[s]:(?:\/\/)?)(?:[-;:&=\+\$,\w]+@)?[A-Za-z0-9.-]+|(?:www.|[-;:&=\+\$,\w]+@)[A-Za-z0-9.-]+)((?:\/[\+~%\/.\w-_]*)?\??(?:[-\+=&;%@.\w_]*)#?(?:[.\!\/\\w]*))?)`
 )
 
 var regUrl = regexp.MustCompile(regexpStr)
 
-type WaitGroupCount struct {
-	sync.WaitGroup
-	sync.Mutex
-	count int
+type Job string
+type Results string
+
+type workerPool struct {
+	workersCount int
+	jobs         chan Job
+	results      chan Results
 }
 
-func (w *WaitGroupCount) decrement() {
-	defer w.Unlock()
-	w.Lock()
-	w.count--
+func NewWorkerPool(c int) *workerPool {
+	return &workerPool{
+		workersCount: c,
+		jobs:         make(chan Job, c),
+		results:      make(chan Results),
+	}
 }
-func (w *WaitGroupCount) increment() {
-	defer w.Unlock()
-	w.Lock()
-	w.count++
+
+func (w *workerPool) Run() {
+	wg := sync.WaitGroup{}
+
+	for i := 0; i < w.workersCount; i++ {
+		wg.Add(1)
+		go worker(w.jobs, w.results, &wg)
+	}
+
+	wg.Wait()
+	close(w.results)
 }
 
 func FindLinks(procNumber int, inputFilename, outputFilename string) error {
@@ -51,23 +62,13 @@ func FindLinks(procNumber int, inputFilename, outputFilename string) error {
 
 	reader := bufio.NewReader(iFile)
 
-	wg := WaitGroupCount{}
-	var mu sync.Mutex
-
-	res := []string{}
 	done := make(chan struct{})
 
-	c := sync.NewCond(&sync.Mutex{})
+	wp := NewWorkerPool(procNumber)
 
 	go func() {
 
 		for !errors.Is(err, io.EOF) {
-			if wg.count == procNumber {
-				c.L.Lock()
-				c.Wait()
-				c.L.Unlock()
-			}
-
 			line := ""
 
 			if iFile == os.Stdin {
@@ -81,92 +82,57 @@ func FindLinks(procNumber int, inputFilename, outputFilename string) error {
 				done <- struct{}{}
 			}
 
-			wg.Add(1)
-			wg.increment()
-			go func() {
-				defer wg.Done()
-				defer wg.decrement()
-
-				urls := urlSearch(line)
-				if len(urls) > 0 {
-					writeToSlice(&urls, &res, &mu)
-				}
-				if wg.count == procNumber {
-					c.Broadcast()
-				}
-			}()
+			wp.jobs <- Job(line)
 
 		}
 		done <- struct{}{}
+		close(wp.jobs)
 
 	}()
+
+	go wp.Run()
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		for v := range wp.results {
+			fmt.Fprintln(oFile, v)
+		}
+		wg.Done()
+	}()
+
 	<-done
 	wg.Wait()
-
-	for _, v := range res {
-		fmt.Fprintln(oFile, v)
-	}
 
 	return nil
 }
 
-func writeToSlice(in, out *[]string, mu *sync.Mutex) {
-	mu.Lock()
-	defer mu.Unlock()
+func worker(jobs <-chan Job, result chan<- Results, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for s := range jobs {
+		urls := regUrl.FindAllString(string(s), -1)
 
-	*out = append(*out, *in...)
-}
+		ch := make(chan string)
+		for _, url := range urls {
+			go func(url string) {
+				resp, err := http.Get(url)
+				if err != nil {
+					return
+				}
+				if resp.StatusCode == http.StatusOK {
+					ch <- url
+				}
+			}(url)
+		}
 
-func urlSearch(s string) (res []string) {
-	urls := cutString(s)
-
-	for i, v := range urls {
-		urls[i] = regUrl.FindString(v)
-	}
-
-	ch := make(chan string)
-
-	for _, url := range urls {
-		go func(url string) {
-			resp, err := http.Get(url)
-			if err != nil {
+		timeout := time.After(5 * time.Second)
+		for i := 0; i < len(urls); i++ {
+			select {
+			case r := <-ch:
+				result <- Results(r)
+			case <-timeout:
 				return
 			}
-			if resp.StatusCode == http.StatusOK {
-				ch <- url
-			}
-		}(url)
-	}
-
-	timeout := time.After(5 * time.Second)
-	for i := 0; i < len(urls); i++ {
-		select {
-		case result := <-ch:
-			res = append(res, result)
-		case <-timeout:
-			return
 		}
 	}
-	return res
-}
-
-func cutString(s string) []string {
-	res := []string{}
-
-	idx1 := strings.Index(s, "http")
-
-	if idx1 != -1 {
-		idx2 := strings.Index(s[idx1+4:], "http")
-		if idx2 != -1 {
-			idx2 += idx1 + 4
-			res = append(res, s[idx1:idx2])
-			if next := cutString(s[idx2:]); len(next) > 0 {
-				res = append(res, next...)
-			}
-		} else {
-			res = append(res, s[idx1:])
-		}
-	}
-
-	return res
 }
